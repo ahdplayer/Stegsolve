@@ -4,13 +4,16 @@ import os
 import subprocess
 import re
 import sys
+import argparse
 import datetime
 from tqdm import tqdm
 import shutil
+from typing import Optional, List, Dict, Set
 
 class StegoAnalyzer:
-    def __init__(self, file_path, output_dir=None):
+    def __init__(self, file_path: str, output_dir: Optional[str] = None, save_separate: bool = False) -> None:
         self.file_path = file_path
+        self.save_separate = save_separate
         
         if output_dir is None:
             base_name = os.path.splitext(os.path.basename(file_path))[0]
@@ -21,7 +24,7 @@ class StegoAnalyzer:
             
         self.file_type = self._get_file_type()
         
-        # CTF Bayrak formatlarını yakalamak için Regex (Örn: SSUC{...}, flag{...}, MİT{...})
+        # CTF Bayrak formatlarını yakalamak için Regex
         # İstikrarlı olması için ön ekin en az 3, iç kısmın en az 4 karakter olması şartı konuldu
         self.flag_pattern = re.compile(r'[a-zA-Z0-9_]{3,30}{[a-zA-Z0-9_!@#$%^&*()-=+\\]{4,}}')
         
@@ -32,14 +35,22 @@ class StegoAnalyzer:
         if not os.path.exists(self.bit_planes_dir):
             os.makedirs(self.bit_planes_dir)
             
-        # Sözlük yükle (macOS/Linux - Anlamlı kelime tespiti için)
-        self.dictionary = set()
-        dict_path = "/usr/share/dict/words"
-        if os.path.exists(dict_path):
-            with open(dict_path, "r", encoding="utf-8", errors="ignore") as f:
+        # Sözlük yükle (Anlamlı kelime tespiti için)
+        self.dictionary: Set[str] = set()
+        unix_dict_path = "/usr/share/dict/words"
+        local_dict_path = "words.txt"
+        
+        if os.path.exists(local_dict_path):
+            with open(local_dict_path, "r", encoding="utf-8", errors="ignore") as f:
                 self.dictionary = set(word.strip().lower() for word in f if len(word.strip()) > 3)
+        elif os.path.exists(unix_dict_path):
+            with open(unix_dict_path, "r", encoding="utf-8", errors="ignore") as f:
+                self.dictionary = set(word.strip().lower() for word in f if len(word.strip()) > 3)
+        else:
+            print("[-] Uyarı: Sözlük dosyası bulunamadı! Anlamlı cümle analizi devre dışı bırakıldı.")
+            print("[*] Bu özelliği kullanmak için lütfen programın bulunduğu dizine İngilizce kelimeleri içeren bir 'words.txt' dosyası oluşturun.\n")
 
-    def _get_file_type(self):
+    def _get_file_type(self) -> str:
         """Dosyanın video mu yoksa fotoğraf mı olduğunu belirler."""
         video_exts = ['.mp4', '.avi', '.mov', '.mkv']
         img_exts = ['.png', '.jpg', '.jpeg', '.bmp', '.tiff']
@@ -52,7 +63,7 @@ class StegoAnalyzer:
         else:
             return "unknown"
 
-    def run_exiftool(self):
+    def run_exiftool(self) -> None:
         """ExifTool ile metadata analizi yapar."""
         print("[+] Metadata (Exif) Analizi yapılıyor...")
         try:
@@ -66,11 +77,11 @@ class StegoAnalyzer:
         except FileNotFoundError:
             print("[-] ExifTool sistemde bulunamadı!")
 
-    def run_strings(self):
+    def run_strings(self) -> None:
         """Dosya içindeki okunabilir gizli metinleri (Strings) çıkarır."""
-        print("[+] Dosya içi gizli metin (Strings) analizi yapılıyor... (min 8 karakter)")
+        print("[+] Dosya içi gizli metin (Strings) analizi yapılıyor... (min 5 karakter)")
         try:
-            # -n 8: Yalnızca ardışık 8 veya daha fazla okunabilir karakter içerenleri getir (Çöp veriyi azaltır)
+            # -n 8: Yalnızca ardışık 5 veya daha fazla okunabilir karakter içerenleri getir (Çöp veriyi azaltır)
             result = subprocess.run(['strings', '-n', '5', self.file_path], capture_output=True, text=True)
             report_path = os.path.join(self.output_dir, "strings_report.txt")
             with open(report_path, "w") as f:
@@ -137,7 +148,7 @@ class StegoAnalyzer:
         except Exception as e:
             print(f"[-] Strings analizi hatası: {e}")
 
-    def _search_flags_in_text(self, source, text):
+    def _search_flags_in_text(self, source: str, text: str) -> None:
         """Verilen metin içinde Regex ile Flag formatı arar."""
         flags = self.flag_pattern.findall(text)
         if flags:
@@ -145,7 +156,7 @@ class StegoAnalyzer:
             with open(os.path.join(self.output_dir, "FOUND_FLAGS.txt"), "a") as f:
                 f.write(f"Source: {source} -> {flags}\n")
 
-    def extract_video_frames(self):
+    def extract_video_frames(self) -> List[str]:
         """Videoyu karelere böler."""
         print("[+] Video tespit edildi. Kareler çıkartılıyor...")
         frames_dir = os.path.join(self.output_dir, "frames")
@@ -156,37 +167,68 @@ class StegoAnalyzer:
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return sorted([os.path.join(frames_dir, f) for f in os.listdir(frames_dir) if f.endswith('.png')])
 
-    def analyze_bit_planes(self, image_path):
-        """Bir görselin R, G, B kanallarının LSB ve MSB bitlerini analiz edip kaydeder."""
+    def analyze_bit_planes(self, image_path: str) -> None:
+        """Bir görselin R, G, B kanallarının LSB ve MSB bitlerini analiz edip tek bir grid olarak kaydeder."""
         img = cv2.imread(image_path)
         if img is None:
             return
 
         b, g, r = cv2.split(img)
         channels = {'Red': r, 'Green': g, 'Blue': b}
+        
+        grid_rows = []
+        height, width = img.shape[:2]
+        header_height = 40
+        base_name = os.path.splitext(os.path.basename(image_path))[0]
 
         for color_name, channel_matrix in channels.items():
+            row_images = []
+            color_bgr = (0, 0, 255) if color_name == 'Red' else (0, 255, 0) if color_name == 'Green' else (255, 0, 0)
+            
+            variations = []
+            
             # En çok veri saklanan kritik bitleri tarıyoruz (0 = LSB, 5,6,7 = MSB)
             for bit in [0, 5, 6, 7]:
-                # Bit düzlemini ayır
                 bit_plane = ((channel_matrix >> bit) & 1) * 255
-                
-                # Bit düzlemini dosyaya kaydet
-                base_name = os.path.splitext(os.path.basename(image_path))[0]
-                save_path = os.path.join(self.bit_planes_dir, f"{base_name}_{color_name}_Bit_{bit}.png")
-                cv2.imwrite(save_path, bit_plane)
+                variations.append((f"{color_name} Bit {bit}", bit_plane))
                 
             # LSB Half (Alt 4 bit)
             lsb_half = (channel_matrix & 0x0F) * 16
-            save_path = os.path.join(self.bit_planes_dir, f"{base_name}_{color_name}_LSB_Half.png")
-            cv2.imwrite(save_path, lsb_half)
+            variations.append((f"{color_name} LSB Half", lsb_half))
             
             # MSB Half (Üst 4 bit)
             msb_half = (channel_matrix & 0xF0)
-            save_path = os.path.join(self.bit_planes_dir, f"{base_name}_{color_name}_MSB_Half.png")
-            cv2.imwrite(save_path, msb_half)
+            variations.append((f"{color_name} MSB Half", msb_half))
+            
+            for title, img_data in variations:
+                if self.save_separate:
+                    safe_title = title.replace(' ', '_')
+                    sep_save_path = os.path.join(self.bit_planes_dir, f"{base_name}_{safe_title}.png")
+                    cv2.imwrite(sep_save_path, img_data)
 
-    def run_binwalk(self):
+                # 3 kanallı BGR'a çevir
+                colored_plane = cv2.cvtColor(img_data, cv2.COLOR_GRAY2BGR)
+                
+                # Etiket için siyah başlık alanı oluştur
+                header = np.zeros((header_height, width, 3), dtype=np.uint8)
+                cv2.putText(header, title, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 1, color_bgr, 2)
+                
+                # Başlık ve görseli dikey olarak birleştir
+                panel = np.vstack((header, colored_plane))
+                row_images.append(panel)
+            
+            # Satırı yatay olarak birleştir
+            row_concat = np.hstack(row_images)
+            grid_rows.append(row_concat)
+            
+        # Tüm satırları dikey olarak birleştir
+        final_grid = np.vstack(grid_rows)
+        
+        # Grid'i tek dosya olarak kaydet
+        save_path = os.path.join(self.bit_planes_dir, f"{base_name}_BitPlanes_Grid.png")
+        cv2.imwrite(save_path, final_grid)
+
+    def run_binwalk(self) -> None:
         """Binwalk ile dosya içine gizlenmiş başka dosyaları (embedded files) tespit eder."""
         print("[+] Binwalk ile gömülü dosya analizi yapılıyor...")
         try:
@@ -226,7 +268,7 @@ class StegoAnalyzer:
         except FileNotFoundError:
             print("[-] Binwalk sistemde bulunamadı! 'brew install binwalk' ile kurabilirsiniz.")
 
-    def start_analysis(self):
+    def start_analysis(self) -> None:
         print(f"=== SİBER İSTİHBARAT STEGANOGRAFİ ARACI ===")
         print(f"Hedef Dosya: {self.file_path}\n")
         
@@ -250,13 +292,17 @@ class StegoAnalyzer:
 
 # --- KULLANIM ---
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        hedef = sys.argv[1]
-    else:
+    parser = argparse.ArgumentParser(description="Siber İstihbarat Steganografi Aracı")
+    parser.add_argument("hedef", nargs='?', help="Analiz edilecek dosyanın yolu")
+    parser.add_argument("--separate", action="store_true", help="Bit düzlemlerini grid'e ek olarak ayrı dosyalar olarak da kaydet")
+    args = parser.parse_args()
+
+    hedef = args.hedef
+    if not hedef:
         hedef = input("Analiz edilecek dosyanın yolunu girin (Örn: banner_video_1.mp4): ")
         
     if os.path.exists(hedef):
-        analyzer = StegoAnalyzer(hedef)
+        analyzer = StegoAnalyzer(hedef, save_separate=args.separate)
         analyzer.start_analysis()
     else:
         print("[-] Dosya bulunamadı!")
